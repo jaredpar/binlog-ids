@@ -29,7 +29,9 @@ foreach (var record in records)
             else
             {
                 Assert(!string.IsNullOrEmpty(e.ProjectFile), $"The project file is null for eval id {buildContext.EvaluationId}");
-                //Assert(buildContext.EvaluationId != BuildEventContext.InvalidEvaluationId, $"The initial evaluation for {Path.GetFileName(e.ProjectFile)} is invalid");
+
+                // This assert trips for pretty much every project
+                Assert(buildContext.EvaluationId != BuildEventContext.InvalidEvaluationId, $"The initial evaluation for {Path.GetFileName(e.ProjectFile)} is invalid");
                 instance = new ProjectInstance(e.ProjectFile ?? "<unknown>", instanceId, buildContext.NodeId, buildContext.EvaluationId, key);
             }
 
