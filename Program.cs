@@ -7,6 +7,7 @@ using System.Text;
 using System.Linq;
 using Microsoft.Build.Framework;
 using Microsoft.Build.Logging.StructuredLogger;
+using System.Runtime.InteropServices;
 
 var printViolations = false;
 var printTree = false;
@@ -67,7 +68,6 @@ void BuildMaps()
     using var stream = File.OpenRead(binlogFilePath);
     var records = BinaryLog.ReadRecords(stream);
     var msbuildTaskMap = new Dictionary<(int, int), MSBuildTask>();
-    var targetCacheMap = new Dictionary<int, HashSet<string>>();
 
     foreach (var record in records)
     {
@@ -108,7 +108,6 @@ void BuildMaps()
                     Assert(!contextMap.ContainsKey(buildContext.ProjectContextId), "Project context already exists");
                     var context = new ProjectContext(buildContext.ProjectContextId, instance, TargetNamesToArray(e.TargetNames), parentContextId, parentTaskId, e.Timestamp);
                     contextMap[buildContext.ProjectContextId] = context;
-                    targetCacheMap[buildContext.ProjectContextId] = new(context.TargetNames);
                 }
                 else
                 {
@@ -118,40 +117,35 @@ void BuildMaps()
             }
             case ProjectFinishedEventArgs e:
             {
-                if (buildContext.ProjectContextId is BuildEventContext.InvalidProjectContextId)
+                if (TryGetProjectContext(buildContext, e.ProjectFile) is { } context)
                 {
-                    Assert(false, $"Invalid context id for finished in {Path.GetFileName(e.ProjectFile)}");
-                    continue;
-                }
+                    Assert(context.Finished is null, $"Got two finished events for {context.ProjectFileName} context id {buildContext.ProjectContextId}");
+                    context.Finished = e.Timestamp;
 
-                if (!contextMap.TryGetValue(buildContext.ProjectContextId, out var context))
-                {
-                    Assert(false, $"Finished without a start for {Path.GetFileName(e.ProjectFile)}");
-                    continue;
-                }
-
-                Assert(context.Finished is null, $"Got two finished events for {context.ProjectFileName} context id {buildContext.ProjectContextId}");
-                context.Finished = e.Timestamp;
-                if (targetCacheMap.TryGetValue(context.ProjectContextId, out var set))
-                {
                     // If targets were requested and all of them were cached then this was a cached execution
                     // of a project.
-                    if (set.Count == 0 && context.TargetNames.Length != 0)
-                    {
-                        context.IsCachedExecution = true;
-                    }
-
-                    targetCacheMap.Remove(context.ProjectContextId);
+                    context.IsCachedExecution = context.TargetNames.All(x => context.TargetsExecuted.TryGetValue(x, out var e) && e == TargetOutcome.Cached);
                 }
-
+                break;
+            }
+            case TargetFinishedEventArgs e:
+            {
+                if (TryGetProjectContext(buildContext, e.ProjectFile) is { } context)
+                {
+                    // The ContainsKey is to guard against a case where we get the skip event before finished. The skip
+                    // event is more authorative.
+                    if (!context.TargetsExecuted.ContainsKey(e.TargetName))
+                    {
+                        context.TargetsExecuted[e.TargetName] = TargetOutcome.Executed;
+                    }
+                }
                 break;
             }
             case TargetSkippedEventArgs { SkipReason: TargetSkipReason.PreviouslyBuiltUnsuccessfully or TargetSkipReason.PreviouslyBuiltSuccessfully or TargetSkipReason.OutputsUpToDate } e:
             {
-                Assert(buildContext.ProjectContextId != BuildEventContext.InvalidProjectContextId, "Invalid context id for target");
-                if (targetCacheMap.TryGetValue(buildContext.ProjectContextId, out var set))
+                if (TryGetProjectContext(buildContext, e.ProjectFile) is { } context)
                 {
-                    _ = set.Remove(e.TargetName);
+                    context.TargetsExecuted[e.TargetName] = TargetOutcome.Cached;
                 }
                 break;
             }
@@ -208,14 +202,41 @@ void BuildMaps()
     }
 
     msbuildTasks.AddRange(msbuildTaskMap.Values);
+
+    ProjectContext? TryGetProjectContext(BuildEventContext c, string? projectFilePath)
+    {
+        var name = projectFilePath is not null
+            ? Path.GetFileName(projectFilePath)
+            : "<unknown>";
+        if (c.ProjectContextId == BuildEventContext.InvalidProjectContextId)
+        {
+            Assert(false, $"Invalid context id for {name}");
+            return null;
+        }
+
+        if (!contextMap.TryGetValue(c.ProjectContextId, out var context))
+        {
+            Assert(false, $"Build event with context {c.ProjectContextId} for {name} before project started ");
+            return null;
+        }
+
+        return context;
+    }
 }
 
 void PrintStalls()
 {
     var nodeMap = BuildNodeExecutionMap();
+    var builder = new StringBuilder();
 
     foreach (var task in msbuildTasks.Where(x => x.ProjectContexts.All(x => x.IsCachedExecution)))
     {
+        // Ignore default targets for now
+        if (task.Targets.Length == 0)
+        {
+            continue;
+        }
+
         if (task.Finished is not { } taskFinished)
         {
             continue;
@@ -228,18 +249,19 @@ void PrintStalls()
         }
 
         var taskContext = contextMap[task.ProjectContextId];
-        Console.WriteLine($"MSBuild Task inside {taskContext.ProjectFileName} (task id {task.TaskId}) (node id {taskContext.ProjectInstance.NodeId})");
-        Console.WriteLine($"\tTargets: {TargetNamesToString(task.Targets)}");
-        Console.WriteLine($"\tStall time: {(taskFinished - task.Started):mm\\:ss}");
+        builder.Length = 0;
 
+        builder.AppendLine($"MSBuild Task inside {taskContext.ProjectFileName} (task id {task.TaskId}) (node id {taskContext.ProjectInstance.NodeId})");
+        builder.AppendLine($"\tTargets: {TargetNamesToString(task.Targets)}");
+        builder.AppendLine($"\tStall time: {(taskFinished - task.Started):mm\\:ss}");
+
+        var anyRealStall = false;
         var stack = new Stack<ProjectContext>();
         foreach (var currentContext in task.ProjectContexts)
         {
             var instance = currentContext.ProjectInstance;
             Assert(task.Started < currentContext.Started, "MSBuild child task started before the msbuild task");
             var timeToChildContext = currentContext.Started - task.Started;
-
-            Console.WriteLine($"\tProject: {currentContext.ProjectFileName} (node {instance.NodeId}) (context {currentContext.ParentContextId}) {timeToChildContext:mm\\:ss}");
             if (timeToChildContext.TotalSeconds < 1)
             {
                 continue;
@@ -273,16 +295,50 @@ void PrintStalls()
                 stack.Push(temp);
             }
 
+            if (IsFalseCacheExecution(task.Targets, currentContext.ProjectInstance, stack))
+            {
+                continue;
+            }
+
+            anyRealStall = true;
+            builder.AppendLine($"\tProject: {currentContext.ProjectFileName} (node {instance.NodeId}) (context {currentContext.ParentContextId}) {timeToChildContext:mm\\:ss}");
+
             foreach (var previousContext in stack)
             {
                 Debug.Assert(previousContext.Finished.HasValue);
                 var start = task.Started > previousContext.Started ? task.Started : previousContext.Started;
                 var previousDuration = previousContext.Finished.Value - start;
-                Console.WriteLine($"\t\tWaiting on: {previousContext.ProjectFileName} (context {previousContext.ProjectContextId})");
-                Console.WriteLine($"\t\tTargets: {TargetNamesToString(previousContext.TargetNames)}");
+                builder.AppendLine($"\t\tExecuted: {previousContext.ProjectFileName} (context {previousContext.ProjectContextId})");
+                builder.AppendLine($"\t\tTargets: {TargetNamesToString(previousContext.TargetNames)}");
                 var durationStr = previousContext.IsCachedExecution ? "Cached Execution" : $"{previousDuration:mm\\:ss}";
-                Console.WriteLine($"\t\tDuration: {durationStr}");
+                builder.AppendLine($"\t\tDuration: {durationStr}");
             }
+        }
+
+        if (anyRealStall)
+        {
+            Console.Write(builder.ToString());
+        }
+
+        // A false cache execution happens when the _final_ request is a cached execution of a target but 
+        // between when the request started and the final request happened the target was acutally executed.
+        // Hence yes this was a cache read but the cache wasn't actually available at the time the request
+        // happened. We can detect this by seeing if any of the targets executed during the duration of
+        // the requesting msbuild task
+        static bool IsFalseCacheExecution(string[] targetNames, ProjectInstance project, IEnumerable<ProjectContext> contexts)
+        {
+            foreach (var context in contexts.Where(x => x.ProjectInstance.ProjectId ==project.ProjectId))
+            {
+                foreach (var targetName in targetNames)
+                {
+                    if (context.TargetsExecuted.TryGetValue(targetName, out var e) && e == TargetOutcome.Executed)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
         }
     }
 }
@@ -418,6 +474,14 @@ internal sealed class ProjectContext(int projectContextId, ProjectInstance proje
     /// </summary>
     internal bool IsCachedExecution { get; set; }
     internal string ProjectFileName => ProjectInstance.ProjectFileName;
+    internal Dictionary<string, TargetOutcome> TargetsExecuted { get; } = new();
     public override string ToString() => $"{ProjectInstance.ProjectFileName} Targets: {TargetNames}";
 }
+
+internal enum TargetOutcome
+{
+    Cached,
+    Executed
+}
+
 
