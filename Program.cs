@@ -34,7 +34,7 @@ while (index < args.Length)
 }
 
 // https://artprodcus3.artifacts.visualstudio.com/A6fcc92e5-73a7-4f88-8d13-d9045b45fb27/cbb18261-c48f-4abb-8651-8cdcb5474649/_apis/artifact/cGlwZWxpbmVhcnRpZmFjdDovL2RuY2VuZy1wdWJsaWMvcHJvamVjdElkL2NiYjE4MjYxLWM0OGYtNGFiYi04NjUxLThjZGNiNTQ3NDY0OS9idWlsZElkLzEyMzMxNzEvYXJ0aWZhY3ROYW1lL0J1aWxkX1dpbmRvd3NfRGVidWcrQXR0ZW1wdCsxK0xvZ3M1/content?format=file&subPath=%2FBuild.binlog
-var binlogFilePath = @"C:\Users\jaredpar\Downloads\Build (1).binlog";
+var binlogFilePath = @"C:\Users\jaredpar\Downloads\Build (4).binlog";
 
 var instanceMap = new Dictionary<int, ProjectInstance>();
 var contextMap = new Dictionary<int, ProjectContext>();
@@ -44,10 +44,12 @@ BuildMaps();
 
 if (printTree)
 {
-    foreach (var context in contextMap.Values.Where(c => c.Parent is null))
-    {
-        PrintContext(context, 0);
-    }
+    PrintTree();
+}
+
+if (printStalls)
+{
+    PrintStalls();
 }
 
 if (printViolations)
@@ -56,11 +58,6 @@ if (printViolations)
     {
         Console.WriteLine($"WARNING: {violation}");
     }
-}
-
-if (printStalls)
-{
-    PrintStalls();
 }
 
 return 0;
@@ -137,7 +134,9 @@ void BuildMaps()
                 context.Finished = e.Timestamp;
                 if (targetCacheMap.TryGetValue(context.ProjectContextId, out var set))
                 {
-                    if (set.Count == 0)
+                    // If targets were requested and all of them were cached then this was a cached execution
+                    // of a project.
+                    if (set.Count == 0 && context.TargetNames.Length != 0)
                     {
                         context.IsCachedExecution = true;
                     }
@@ -213,7 +212,93 @@ void BuildMaps()
 
 void PrintStalls()
 {
-    var nodeMap = new Dictionary<int, SortedList<(DateTime, DateTime), ProjectContext>>();
+    var nodeMap = BuildNodeExecutionMap();
+
+    foreach (var task in msbuildTasks.Where(x => x.ProjectContexts.All(x => x.IsCachedExecution)))
+    {
+        if (task.Finished is not { } taskFinished)
+        {
+            continue;
+        }
+
+        var taskDuration = taskFinished - task.Started;
+        if (taskDuration.TotalSeconds < 1)
+        {
+            continue;
+        }
+
+        var taskContext = contextMap[task.ProjectContextId];
+        Console.WriteLine($"MSBuild Task inside {taskContext.ProjectFileName} (task id {task.TaskId}) (node id {taskContext.ProjectInstance.NodeId})");
+        Console.WriteLine($"\tTargets: {TargetNamesToString(task.Targets)}");
+        Console.WriteLine($"\tStall time: {(taskFinished - task.Started):mm\\:ss}");
+
+        var stack = new Stack<ProjectContext>();
+        foreach (var currentContext in task.ProjectContexts)
+        {
+            var instance = currentContext.ProjectInstance;
+            Assert(task.Started < currentContext.Started, "MSBuild child task started before the msbuild task");
+            var timeToChildContext = currentContext.Started - task.Started;
+
+            Console.WriteLine($"\tProject: {currentContext.ProjectFileName} (node {instance.NodeId}) (context {currentContext.ParentContextId}) {timeToChildContext:mm\\:ss}");
+            if (timeToChildContext.TotalSeconds < 1)
+            {
+                continue;
+            }
+
+            stack.Clear();
+            var nodeList = nodeMap[instance.NodeId];
+            var index = nodeList.IndexOfKey(currentContext.Started) - 1;
+            while (index > 0)
+            {
+                var temp = nodeList.GetValueAtIndex(index);
+                index--;
+
+                // Ignore project executions that occur on the same node as this is not a stall. The work is just
+                // happening on this node
+                if (temp.ProjectInstance.NodeId == taskContext.ProjectInstance.NodeId)
+                {
+                    continue;
+                }
+
+                if (temp.Finished is not { } tempFinished)
+                {
+                    continue;
+                }
+
+                if (tempFinished < task.Started)
+                {
+                    break;
+                }
+
+                stack.Push(temp);
+            }
+
+            foreach (var previousContext in stack)
+            {
+                Debug.Assert(previousContext.Finished.HasValue);
+                var start = task.Started > previousContext.Started ? task.Started : previousContext.Started;
+                var previousDuration = previousContext.Finished.Value - start;
+                Console.WriteLine($"\t\tWaiting on: {previousContext.ProjectFileName} (context {previousContext.ProjectContextId})");
+                Console.WriteLine($"\t\tTargets: {TargetNamesToString(previousContext.TargetNames)}");
+                var durationStr = previousContext.IsCachedExecution ? "Cached Execution" : $"{previousDuration:mm\\:ss}";
+                Console.WriteLine($"\t\tDuration: {durationStr}");
+            }
+        }
+    }
+}
+
+int? GetProjectInstanceId(BuildEventContext context) => (context.EvaluationId, context.ProjectInstanceId) switch
+{
+    (BuildEventContext.InvalidEvaluationId, BuildEventContext.InvalidProjectInstanceId) => null,
+    (BuildEventContext.InvalidEvaluationId, var id) => id,
+    (var id, BuildEventContext.InvalidProjectInstanceId) => id,
+    (var evalId, _) => evalId,
+};
+
+// Build a map of node id to sorted list of project executions based on time on that node 
+Dictionary<int, SortedList<DateTime, ProjectContext>> BuildNodeExecutionMap()
+{
+    var nodeMap = new Dictionary<int, SortedList<DateTime, ProjectContext>>();
     foreach (var context in contextMap.Values)
     {
         if (context.Finished is not { } finished)
@@ -227,35 +312,27 @@ void PrintStalls()
             list = new();
             nodeMap[nodeId] = list;
         }
-
-        var key = (context.Started, finished);
-        list.Add(key, context);
+        list.Add(context.Started, context);
     }
 
-    foreach (var context in contextMap.Values)
-    {
-        if (context.IsCachedExecution)
-        {
-            Console.WriteLine($"{context.ProjectFileName} Targets: {TargetNamesToString(context.TargetNames)}");
-        }
-    }
+    return nodeMap;
 }
 
-int? GetProjectInstanceId(BuildEventContext context) => (context.EvaluationId, context.ProjectInstanceId) switch
+void PrintTree()
 {
-    (BuildEventContext.InvalidEvaluationId, BuildEventContext.InvalidProjectInstanceId) => null,
-    (BuildEventContext.InvalidEvaluationId, var id) => id,
-    (var id, BuildEventContext.InvalidProjectInstanceId) => id,
-    (var evalId, _) => evalId,
-};
-
-void PrintContext(ProjectContext context, int indentLength)
-{
-    var indent = new string(' ', indentLength);
-    Console.WriteLine($"{indent}Project: {context.ProjectFileName} Target Names: {TargetNamesToString(context.TargetNames)}");
-    foreach (var c in contextMap.Values.Where(c => c.Parent == context))
+    foreach (var context in contextMap.Values.Where(c => c.Parent is null))
     {
-        PrintContext(c, indentLength + 2);
+        PrintContext(context, 0);
+    }
+
+    void PrintContext(ProjectContext context, int indentLength)
+    {
+        var indent = new string(' ', indentLength);
+        Console.WriteLine($"{indent}Project: {context.ProjectFileName} Target Names: {TargetNamesToString(context.TargetNames)}");
+        foreach (var c in contextMap.Values.Where(c => c.Parent == context))
+        {
+            PrintContext(c, indentLength + 2);
+        }
     }
 }
 
@@ -267,6 +344,9 @@ void Assert(bool condition, string message)
     }
 }
 
+// This is a convenient hash function to create a key from a set of properties. It's 
+// used to quickly compare if two sets of properties are the same. Helpful in
+// telling if project instances are equivalent.
 static string GetKey(IDictionary<string, string>? properties)
 {
     if (properties is null)
