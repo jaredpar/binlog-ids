@@ -10,7 +10,7 @@ using Microsoft.Build.Logging.StructuredLogger;
 
 var printViolations = false;
 var printTree = false;
-var printStalls = false;
+var printStalls = true;
 var index = 0;
 while (index < args.Length)
 {
@@ -58,6 +58,11 @@ if (printViolations)
     }
 }
 
+if (printStalls)
+{
+    PrintStalls();
+}
+
 return 0;
 
 void BuildMaps()
@@ -65,6 +70,8 @@ void BuildMaps()
     using var stream = File.OpenRead(binlogFilePath);
     var records = BinaryLog.ReadRecords(stream);
     var msbuildTaskMap = new Dictionary<(int, int), MSBuildTask>();
+    var targetCacheMap = new Dictionary<int, HashSet<string>>();
+
     foreach (var record in records)
     {
         if (record.Args is not { BuildEventContext: { } buildContext })
@@ -102,7 +109,9 @@ void BuildMaps()
                     }
 
                     Assert(!contextMap.ContainsKey(buildContext.ProjectContextId), "Project context already exists");
-                    contextMap[buildContext.ProjectContextId] = new ProjectContext(instance, TargetNamesToArray(e.TargetNames), parentContextId, parentTaskId, e.Timestamp);
+                    var context = new ProjectContext(buildContext.ProjectContextId, instance, TargetNamesToArray(e.TargetNames), parentContextId, parentTaskId, e.Timestamp);
+                    contextMap[buildContext.ProjectContextId] = context;
+                    targetCacheMap[buildContext.ProjectContextId] = new(context.TargetNames);
                 }
                 else
                 {
@@ -126,6 +135,25 @@ void BuildMaps()
 
                 Assert(context.Finished is null, $"Got two finished events for {context.ProjectFileName} context id {buildContext.ProjectContextId}");
                 context.Finished = e.Timestamp;
+                if (targetCacheMap.TryGetValue(context.ProjectContextId, out var set))
+                {
+                    if (set.Count == 0)
+                    {
+                        context.IsCachedExecution = true;
+                    }
+
+                    targetCacheMap.Remove(context.ProjectContextId);
+                }
+
+                break;
+            }
+            case TargetSkippedEventArgs { SkipReason: TargetSkipReason.PreviouslyBuiltUnsuccessfully or TargetSkipReason.PreviouslyBuiltSuccessfully or TargetSkipReason.OutputsUpToDate } e:
+            {
+                Assert(buildContext.ProjectContextId != BuildEventContext.InvalidProjectContextId, "Invalid context id for target");
+                if (targetCacheMap.TryGetValue(buildContext.ProjectContextId, out var set))
+                {
+                    _ = set.Remove(e.TargetName);
+                }
                 break;
             }
             case TaskStartedEventArgs { TaskName: "MSBuild" } e:
@@ -172,6 +200,11 @@ void BuildMaps()
             {
                 task.ProjectContexts.Add(context);
             }
+
+            if (context.Finished is { } finished)
+            {
+                context.ProjectInstance.Executions.Add((context.Started, finished), context);
+            }
         }
     }
 
@@ -180,7 +213,32 @@ void BuildMaps()
 
 void PrintStalls()
 {
+    var nodeMap = new Dictionary<int, SortedList<(DateTime, DateTime), ProjectContext>>();
+    foreach (var context in contextMap.Values)
+    {
+        if (context.Finished is not { } finished)
+        {
+            continue;
+        }
 
+        var nodeId = context.ProjectInstance.NodeId;
+        if (!nodeMap.TryGetValue(nodeId, out var list))
+        {
+            list = new();
+            nodeMap[nodeId] = list;
+        }
+
+        var key = (context.Started, finished);
+        list.Add(key, context);
+    }
+
+    foreach (var context in contextMap.Values)
+    {
+        if (context.IsCachedExecution)
+        {
+            Console.WriteLine($"{context.ProjectFileName} Targets: {TargetNamesToString(context.TargetNames)}");
+        }
+    }
 }
 
 int? GetProjectInstanceId(BuildEventContext context) => (context.EvaluationId, context.ProjectInstanceId) switch
@@ -194,7 +252,7 @@ int? GetProjectInstanceId(BuildEventContext context) => (context.EvaluationId, c
 void PrintContext(ProjectContext context, int indentLength)
 {
     var indent = new string(' ', indentLength);
-    Console.WriteLine($"{indent}Project: {context.ProjectFileName} Target Names: {context.TargetNames}");
+    Console.WriteLine($"{indent}Project: {context.ProjectFileName} Target Names: {TargetNamesToString(context.TargetNames)}");
     foreach (var c in contextMap.Values.Where(c => c.Parent == context))
     {
         PrintContext(c, indentLength + 2);
@@ -228,6 +286,9 @@ static string GetKey(IDictionary<string, string>? properties)
     return Convert.ToHexString(bytes);
 }
 
+static string TargetNamesToString(string[] targetNames) =>
+    string.Join(';', targetNames);
+
 static string[] TargetNamesToArray(string? targetNames)
 {
     if (targetNames is null)
@@ -256,11 +317,13 @@ internal sealed class ProjectInstance(string projectFilePath, int projectInstanc
     internal int NodeId { get; } = nodeId;
     internal int EvaluationId { get; } = evaluationId;
     internal string Key { get; } = key;
+    internal SortedList<(DateTime, DateTime), ProjectContext> Executions { get; } = new();
     public override string ToString() => $"{ProjectFileName} {Key}";
 };
 
-internal sealed class ProjectContext(ProjectInstance projectInstance, string[] targetNames, int? parentContextId, int? parentTaskId, DateTime started)
+internal sealed class ProjectContext(int projectContextId, ProjectInstance projectInstance, string[] targetNames, int? parentContextId, int? parentTaskId, DateTime started)
 {
+    internal int ProjectContextId { get; } = projectContextId;
     internal ProjectInstance ProjectInstance { get; } = projectInstance;
     internal string[] TargetNames { get; } = targetNames;
     internal int? ParentContextId { get; } = parentContextId;
@@ -268,6 +331,12 @@ internal sealed class ProjectContext(ProjectInstance projectInstance, string[] t
     internal ProjectContext? Parent { get; set; }
     internal DateTime Started { get; } = started;
     internal DateTime? Finished { get; set; }
+
+    /// <summary>
+    /// This is true when the project context was a pure cache hit. Nothing actually happened. The execution
+    /// just queried the results of previously executed targets.
+    /// </summary>
+    internal bool IsCachedExecution { get; set; }
     internal string ProjectFileName => ProjectInstance.ProjectFileName;
     public override string ToString() => $"{ProjectInstance.ProjectFileName} Targets: {TargetNames}";
 }
