@@ -68,6 +68,7 @@ void BuildMaps()
     using var stream = File.OpenRead(binlogFilePath);
     var records = BinaryLog.ReadRecords(stream);
     var msbuildTaskMap = new Dictionary<(int, int), MSBuildTask>();
+    var targetNameMap = new Dictionary<(int, int), string>();
 
     foreach (var record in records)
     {
@@ -128,6 +129,11 @@ void BuildMaps()
                 }
                 break;
             }
+            case TargetStartedEventArgs e:
+            {
+                targetNameMap[(buildContext.ProjectContextId, buildContext.TargetId)] = e.TargetName;
+                break;
+            }
             case TargetFinishedEventArgs e:
             {
                 if (TryGetProjectContext(buildContext, e.ProjectFile) is { } context)
@@ -139,6 +145,8 @@ void BuildMaps()
                         context.TargetsExecuted[e.TargetName] = TargetOutcome.Executed;
                     }
                 }
+
+                targetNameMap.Remove((buildContext.ProjectContextId, buildContext.TargetId));
                 break;
             }
             case TargetSkippedEventArgs { SkipReason: TargetSkipReason.PreviouslyBuiltUnsuccessfully or TargetSkipReason.PreviouslyBuiltSuccessfully or TargetSkipReason.OutputsUpToDate } e:
@@ -153,7 +161,13 @@ void BuildMaps()
             {
                 Assert(buildContext.TaskId != BuildEventContext.InvalidTaskId, "Invalid task id for msbuild");
                 Assert(buildContext.ProjectContextId != BuildEventContext.InvalidProjectContextId, "Invalid context id for msbuild");
-                msbuildTaskMap[(buildContext.ProjectContextId, buildContext.TaskId)] = new MSBuildTask(buildContext.ProjectContextId, buildContext.TaskId, e.Timestamp);
+                var task = msbuildTaskMap[(buildContext.ProjectContextId, buildContext.TaskId)] = new MSBuildTask(buildContext.ProjectContextId, buildContext.TaskId, e.Timestamp);
+                if (targetNameMap.TryGetValue((buildContext.ProjectContextId, buildContext.TargetId), out var name))
+                {
+                    task.ContainingTargetName = name;
+                }
+
+                msbuildTaskMap[(buildContext.ProjectContextId, buildContext.TaskId)] = task;
                 break;
             }
             case TaskParameterEventArgs { Kind: TaskParameterMessageKind.TaskInput, ItemType: "Targets" } e:
@@ -252,7 +266,8 @@ void PrintStalls()
         builder.Length = 0;
 
         builder.AppendLine($"MSBuild Task inside {taskContext.ProjectFileName} (task id {task.TaskId}) (node id {taskContext.ProjectInstance.NodeId})");
-        builder.AppendLine($"\tTargets: {TargetNamesToString(task.Targets)}");
+        builder.AppendLine($"\tContaining Target: {task.ContainingTargetName}");
+        builder.AppendLine($"\tExecuted Targets: {TargetNamesToString(task.Targets)}");
         builder.AppendLine($"\tStall time: {(taskFinished - task.Started):mm\\:ss}");
 
         var anyRealStall = false;
@@ -440,6 +455,7 @@ internal sealed class MSBuildTask(int projectContextId, int taskId, DateTime sta
     internal int ProjectContextId { get; } = projectContextId;
     internal int TaskId { get; } = taskId;
     internal string[] Targets { get; set; } = [];
+    internal string? ContainingTargetName { get; set; }
     internal DateTime Started { get; } = started;
     internal DateTime? Finished { get; set; }
     internal List<ProjectContext> ProjectContexts { get; } = new();
