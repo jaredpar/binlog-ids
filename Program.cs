@@ -9,6 +9,11 @@ using Microsoft.Build.Framework;
 using Microsoft.Build.Logging.StructuredLogger;
 using System.Runtime.InteropServices;
 
+// https://artprodcus3.artifacts.visualstudio.com/A6fcc92e5-73a7-4f88-8d13-d9045b45fb27/cbb18261-c48f-4abb-8651-8cdcb5474649/_apis/artifact/cGlwZWxpbmVhcnRpZmFjdDovL2RuY2VuZy1wdWJsaWMvcHJvamVjdElkL2NiYjE4MjYxLWM0OGYtNGFiYi04NjUxLThjZGNiNTQ3NDY0OS9idWlsZElkLzEyMzMxNzEvYXJ0aWZhY3ROYW1lL0J1aWxkX1dpbmRvd3NfRGVidWcrQXR0ZW1wdCsxK0xvZ3M1/content?format=file&subPath=%2FBuild.binlog
+//var binlogFilePath = @"C:\Users\jaredpar\Downloads\Build (4).binlog";
+
+// https://artprodcus3.artifacts.visualstudio.com/A6fcc92e5-73a7-4f88-8d13-d9045b45fb27/cbb18261-c48f-4abb-8651-8cdcb5474649/_apis/artifact/cGlwZWxpbmVhcnRpZmFjdDovL2RuY2VuZy1wdWJsaWMvcHJvamVjdElkL2NiYjE4MjYxLWM0OGYtNGFiYi04NjUxLThjZGNiNTQ3NDY0OS9idWlsZElkLzEyMzQ1MDYvYXJ0aWZhY3ROYW1lL0J1aWxkX1dpbmRvd3NfRGVidWcrQXR0ZW1wdCsxK0xvZ3M1/content?format=file&subPath=%2FBuild.binlog
+var binlogFilePath = @"C:\Users\jaredpar\Downloads\Build (5).binlog";
 var printViolations = false;
 var printTree = false;
 var printStalls = true;
@@ -27,16 +32,14 @@ while (index < args.Length)
             printStalls = true;
             break;
         default:
-            Console.WriteLine($"Bad option: {args[index]}");
-            return 1;
+            binlogFilePath = args[index];
+            break;
     }
 
     index++;
 }
 
-// https://artprodcus3.artifacts.visualstudio.com/A6fcc92e5-73a7-4f88-8d13-d9045b45fb27/cbb18261-c48f-4abb-8651-8cdcb5474649/_apis/artifact/cGlwZWxpbmVhcnRpZmFjdDovL2RuY2VuZy1wdWJsaWMvcHJvamVjdElkL2NiYjE4MjYxLWM0OGYtNGFiYi04NjUxLThjZGNiNTQ3NDY0OS9idWlsZElkLzEyMzMxNzEvYXJ0aWZhY3ROYW1lL0J1aWxkX1dpbmRvd3NfRGVidWcrQXR0ZW1wdCsxK0xvZ3M1/content?format=file&subPath=%2FBuild.binlog
-var binlogFilePath = @"C:\Users\jaredpar\Downloads\Build (4).binlog";
-
+Console.WriteLine($"Using binlog {binlogFilePath}");
 var instanceMap = new Dictionary<int, ProjectInstance>();
 var contextMap = new Dictionary<int, ProjectContext>();
 var msbuildTasks = new List<MSBuildTask>();
@@ -210,7 +213,7 @@ void BuildMaps()
 
             if (context.Finished is { } finished)
             {
-                context.ProjectInstance.Executions.Add((context.Started, finished), context);
+                context.ProjectInstance.Executions.Add(context.Started, context);
             }
         }
     }
@@ -252,6 +255,10 @@ void PrintStalls()
         }
 
         if (task.Finished is not { } taskFinished)
+        {
+            continue;
+        }
+        if (!IsTaskWaiting(task, taskFinished))
         {
             continue;
         }
@@ -351,6 +358,33 @@ void PrintStalls()
                         return true;
                     }
                 }
+            }
+
+            return false;
+        }
+
+        // Determine if this task is just waiting. That is the node does nothing durith the time it's waiting for 
+        // cached target requests to complete
+        bool IsTaskWaiting(MSBuildTask task, DateTime taskFinished)
+        {
+            var context = contextMap[task.ProjectContextId];
+            var nodeTimeline = nodeMap[context.ProjectInstance.NodeId];
+
+            var index = nodeTimeline.IndexOfKey(context.Started) + 1;
+            while (index < nodeTimeline.Count)
+            {
+                var current = nodeTimeline.GetValueAtIndex(index);
+                if (current.Started > task.Started && current.Started < taskFinished)
+                {
+                    return false;
+                }
+
+                if (current.Started > taskFinished)
+                {
+                    return true;
+                }
+
+                index++;
             }
 
             return false;
@@ -469,7 +503,7 @@ internal sealed class ProjectInstance(string projectFilePath, int projectInstanc
     internal int NodeId { get; } = nodeId;
     internal int EvaluationId { get; } = evaluationId;
     internal string Key { get; } = key;
-    internal SortedList<(DateTime, DateTime), ProjectContext> Executions { get; } = new();
+    internal SortedList<DateTime, ProjectContext> Executions { get; } = new();
     public override string ToString() => $"{ProjectFileName} {Key}";
 };
 
