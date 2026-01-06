@@ -495,6 +495,11 @@ internal sealed class MSBuildTask(int projectContextId, int taskId, DateTime sta
     internal List<ProjectContext> ProjectContexts { get; } = new();
 }
 
+/// <summary>
+/// Represents a project + global properties combination within a build. Invoking several targets 
+/// the same project + global properties will result in a single <see cref="ProjectInstance"/> but
+/// multiple <see cref="ProjectContext"/> instances representing each target invocation.
+/// </summary>
 internal sealed class ProjectInstance(string projectFilePath, int projectInstanceId, int nodeId, int evaluationId, string key)
 {
     internal string ProjectFilePath { get; } = projectFilePath;
